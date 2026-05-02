@@ -32,7 +32,7 @@ if __name__ == '__main__':
     ppc = 1
 
     # Gravity
-    G = 9.81
+    G = 1.62
 
     # Data acquisition rate
     frame_rate = 60 / scale_time  # [Hz]
