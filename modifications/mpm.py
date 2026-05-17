@@ -116,6 +116,15 @@ class MPM:
       kwargs['scripted_rotation_id'] = function_addresses.index(kwargs['scripted_rotation'])
     if 'scripted_position' in kwargs:
       kwargs['scripted_position_id'] = function_addresses.index(kwargs['scripted_position'])
+    # added: same registration for time-varying applied force / torque.
+    # Both use the same Function13 (3D) / Function12 (2D) signature as
+    # scripted_position (real t -> Vector). For torque in 2D only the [0]
+    # component of the returned vector is used (engine has a scalar torque
+    # in 2D).
+    if 'applied_force_fn' in kwargs:
+      kwargs['applied_force_fn_id'] = function_addresses.index(kwargs['applied_force_fn'])
+    if 'applied_torque_fn' in kwargs:
+      kwargs['applied_torque_fn_id'] = function_addresses.index(kwargs['applied_torque_fn'])
     return self.c.add_particles(P(**kwargs))
 
   ## update_levelset called from the current file (step) -----------------------
