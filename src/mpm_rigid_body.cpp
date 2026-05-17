@@ -13,6 +13,29 @@
 
 TC_NAMESPACE_BEGIN
 
+// added: helpers to convert a generic Vector to the engine's per-dim torque
+// type when applying external torque to a rigid body. In 3D the torque is a
+// 3-vector (same as Vector). In 2D the torque is a scalar, and we adopt the
+// convention that the scalar is stored in component [0] of the user-supplied
+// Vector. These helpers let advect_rigid_bodies() write a single non-branched
+// call to apply_torque() that compiles for both dims.
+template <int dim>
+struct AppliedTorqueAdapter {};
+
+template <>
+struct AppliedTorqueAdapter<2> {
+  // For 2D: AngularVelocity<2>::ValueType == real (scalar).
+  static real to_engine_torque(const VectorND<2, real> &v) { return v[0]; }
+};
+
+template <>
+struct AppliedTorqueAdapter<3> {
+  // For 3D: AngularVelocity<3>::ValueType == Vector3 (== VectorND<3, real>).
+  static VectorND<3, real> to_engine_torque(const VectorND<3, real> &v) {
+    return v;
+  }
+};
+
 void check_scripting_parameters(const Config &config) {
   TC_ASSERT_INFO(!config.has_key("scripted"),
                  "'scripted' is deprecated. Please remove."); ///////////// ????
@@ -77,6 +100,45 @@ std::unique_ptr<RigidBody<dim>> MPM<dim>::create_rigid_body(Config config) {
   rigid.color = config.get("color", Vector3(0.5_f));
   rigid.linear_damping = config.get("linear_damping", 0.0f);
   rigid.angular_damping = config.get("angular_damping", 0.0f);
+
+  // added: external (driving) force and torque on the rigid body's COM.
+  // Two ways to specify each:
+  //   STATIC:    config["applied_force"]    = Vector(...)
+  //              config["applied_torque"]   = Vector(...)
+  //   FUNCTION:  config["applied_force_fn"] = uint64 pointer to Function13
+  //              config["applied_torque_fn"]= uint64 pointer to Function13
+  // The function form takes precedence if both are given. The function is
+  // called every substep with the current simulation time; it lets you
+  // gate the drive, ramp it, or schedule arbitrary time-varying loads
+  // without re-creating the rigid body.
+  rigid.applied_force  = config.get("applied_force",  Vector(0.0_f));
+  rigid.applied_torque = config.get("applied_torque", Vector(0.0_f));
+
+  // Read optional function-form drive, exactly the same way as
+  // scripted_position / scripted_rotation are read above.
+  typename RigidBody<dim>::ForceFunctionType *force_fn =
+      (typename RigidBody<dim>::ForceFunctionType *)config.get(
+          "applied_force_fn", (uint64)0);
+  typename RigidBody<dim>::TorqueFunctionType *torque_fn =
+      (typename RigidBody<dim>::TorqueFunctionType *)config.get(
+          "applied_torque_fn", (uint64)0);
+  if (force_fn) {
+    rigid.applied_force_func = *force_fn;
+    rigid.applied_force_func_id = config.get<int>("applied_force_fn_id");
+  }
+  if (torque_fn) {
+    rigid.applied_torque_func = *torque_fn;
+    rigid.applied_torque_func_id = config.get<int>("applied_torque_fn_id");
+  }
+
+  // added: "freeze on axis exit" runtime safety net (for dynamic bodies).
+  // Opt-in via freeze_on_axis_exit=True in the Python config.
+  rigid.freeze_on_axis_exit =
+      config.get("freeze_on_axis_exit", false);
+  rigid.freeze_axis     = config.get("freeze_axis",     0);
+  rigid.freeze_axis_min = config.get("freeze_axis_min", -1e30_f);
+  rigid.freeze_axis_max = config.get("freeze_axis_max",  1e30_f);
+  rigid.is_frozen       = false;
 
   typename RigidBody<dim>::PositionFunctionType *f =
       (typename RigidBody<dim>::PositionFunctionType *)config.get(
@@ -294,10 +356,53 @@ void MPM<dim>::advect_rigid_bodies(real dt) {
     }
 
     // rigid body gravity 
-    if (config_backup.get("rigidBody_gravity", true)) {  // added
+    // Frozen bodies are pinned (see freeze-on-axis-exit block below); applying
+    // gravity to them would just create wasted impulses immediately undone by
+    // the pin. Skip it.
+    if (config_backup.get("rigidBody_gravity", true) && !rigid.is_frozen) {
       rigid.apply_impulse(this->gravity * rigid.get_mass() * dt, rigid.position);
     }
-    
+
+    // ADDED: externally applied (driving) force and torque on COM.
+    // Only effective for dynamic bodies. For kinematic bodies (pos_func /
+    // rot_func set) the imposed trajectory takes over in advance(), so we
+    // skip the contribution.
+    //
+    // Each load can be specified as either a static Vector (applied_force /
+    // applied_torque) or a function of time (applied_force_func /
+    // applied_torque_func). If the function form is set, it is evaluated
+    // at this->current_t to obtain the instantaneous load; otherwise the
+    // static value is used. This lets the user gate, ramp, or otherwise
+    // schedule arbitrary time-varying loads from Python without changing
+    // the engine.
+    //
+    // Force on the COM: apply_impulse(impulse, position) uses the body's
+    // position as the application point, so the arm (orig - position) is
+    // zero and only velocity changes.
+    //
+    // Torque on the COM: apply_torque accepts AngularVelocity<dim>::ValueType
+    // (scalar in 2D, Vector3 in 3D). The Vector form is adapted by
+    // AppliedTorqueAdapter<dim>.
+    if (!rigid.pos_func && !rigid.is_frozen) {
+      // Evaluate force: function form takes precedence over static.
+      Vector force_now = rigid.applied_force_func
+                             ? rigid.applied_force_func(this->current_t)
+                             : rigid.applied_force;
+      if (force_now.abs_max() > 0.0_f) {
+        rigid.apply_impulse(force_now * dt, rigid.position);
+      }
+    }
+    if (!rigid.rot_func && !rigid.is_frozen) {
+      // Evaluate torque: function form takes precedence over static.
+      Vector torque_now = rigid.applied_torque_func
+                              ? rigid.applied_torque_func(this->current_t)
+                              : rigid.applied_torque;
+      if (torque_now.abs_max() > 0.0_f) {
+        rigid.apply_torque(
+            AppliedTorqueAdapter<dim>::to_engine_torque(torque_now) * dt);
+      }
+    }
+
     int free_axis_in_position = config_backup.get("free_axis_in_position", 0); // added
 
     // advance
@@ -307,6 +412,91 @@ void MPM<dim>::advect_rigid_bodies(real dt) {
     if (rigid.rotation_axis.abs_max() > 0.1_f) {
       rigid.enforce_angular_velocity_parallel_to(rigid.rotation_axis);
     }
+
+    // ADDED: lock specific linear / angular DOFs (only for dynamic bodies).
+    // Pass e.g. lock_linear_axes=(0,0,1) and lock_angular_axes=(1,1,0) in the
+    // MPM Python config to keep the body on a 2D plane (wheel rig).
+    // A component > 0.5 means "lock this axis". For kinematic bodies the
+    // trajectory is the source of truth, so we skip this.
+    if (!rigid.pos_func) {
+      Vector lock_lin =
+          config_backup.get("lock_linear_axes", Vector(0.0_f));
+      if (lock_lin.abs_max() > 0.5_f) {
+        for (int i = 0; i < dim; i++) {
+          if (lock_lin[i] > 0.5_f) {
+            rigid.velocity[i] = 0.0_f;
+          }
+        }
+      }
+    }
+    if (!rigid.rot_func) {
+      Vector lock_ang =
+          config_backup.get("lock_angular_axes", Vector(0.0_f));
+      if (lock_ang.abs_max() > 0.5_f) {
+        TC_STATIC_IF(dim == 3) {
+          for (int i = 0; i < dim; i++) {
+            if (lock_ang[i] > 0.5_f) {
+              id(rigid.angular_velocity).value[i] = 0.0_f;
+            }
+          }
+        }
+        TC_STATIC_END_IF
+      }
+    }
+
+    // ADDED: freeze-on-axis-exit safety net.
+    // Opt-in per body via freeze_on_axis_exit=True. If enabled, check
+    // whether the body's position along the chosen axis has left the
+    // [min, max] interval. The first time it does, we LATCH is_frozen=true
+    // (one-way) and capture the current pose (position + rotation) into
+    // frozen_position / frozen_rotation. From that step on, the body is
+    // effectively kinematic with a constant scripted pose:
+    //   - position    <- frozen_position   (overrides any drift)
+    //   - rotation    <- frozen_rotation   (overrides any drift)
+    //   - velocity    <- 0
+    //   - angular_vel <- 0
+    // applied_* loads are already gated by is_frozen above, so the body
+    // genuinely stops being driven. Gravity and soil-contact impulses still
+    // computed by the engine but their effect is immediately cancelled by
+    // the pin. Skipped entirely for already-kinematic bodies.
+    if (rigid.freeze_on_axis_exit && !rigid.pos_func && !rigid.rot_func) {
+      if (!rigid.is_frozen) {
+        int axis = rigid.freeze_axis;
+        if (axis >= 0 && axis < dim) {
+          real p = rigid.position[axis];
+          if (p < rigid.freeze_axis_min || p > rigid.freeze_axis_max) {
+            rigid.is_frozen = true;
+            // Capture the pose at the moment of triggering. We use position
+            // and rotation as observed RIGHT NOW (after this step's advance,
+            // any locks, etc.) so the pin matches what the user/network last
+            // saw rendered.
+            rigid.frozen_position = rigid.position;
+            rigid.frozen_rotation = rigid.rotation;
+            TC_INFO("Rigid body {} frozen at t = {}: position[{}] = {} "
+                    "outside [{}, {}]; pinning pose.",
+                    rigid.id, this->current_t, axis, p,
+                    rigid.freeze_axis_min, rigid.freeze_axis_max);
+          }
+        }
+      }
+      if (rigid.is_frozen) {
+        // Pin pose to the captured value. This overrides anything that
+        // happened during this step (advance + contact + locks) and keeps
+        // the body geometrically still, like a kinematic body with constant
+        // scripted_position / scripted_rotation.
+        rigid.position = rigid.frozen_position;
+        rigid.rotation = rigid.frozen_rotation;
+        rigid.velocity = Vector(0.0_f);
+        TC_STATIC_IF(dim == 3) {
+          id(rigid.angular_velocity).value = id(Vector(0.0_f));
+        }
+        TC_STATIC_ELSE {
+          id(rigid.angular_velocity.value) = 0;
+        }
+        TC_STATIC_END_IF
+      }
+    }
+
     // print rigid body state
     if (config_backup.get("print_rigid_body_state", true)) {
       // TC_P(rigid->get_mass());
