@@ -63,6 +63,54 @@ struct RigidBody {
   Vector rigid_force_tmp, rigid_torque_tmp;
   Vector rigid_force, rigid_torque;
 
+  // added: Externally applied (driving) force and torque, in sim units.
+  // Two ways to specify each: either a static Vector (set once at creation,
+  // applied every step) OR a function of time (called every substep). The
+  // function form is preferred when the load needs to vary in time -- e.g.
+  // a torque that activates only after a rest phase, or that ramps up. If
+  // both forms are present, the FUNCTION takes precedence (the static value
+  // is ignored).
+  Vector applied_force;
+  Vector applied_torque;
+  // Function forms. Same Function13 type as scripted_position/scripted_rotation
+  // (3D: takes real t, returns Vector3). In 2D the function still returns
+  // VectorND<2,real> for force; for torque, only component [0] is used (the
+  // engine's 2D AngularVelocity is a scalar). Function ids are stored so the
+  // engine can serialise/deserialise scenes consistently with the existing
+  // scripted_* infrastructure.
+  using ForceFunctionType  = PositionFunctionType;  // Function13 / Function12
+  using TorqueFunctionType = PositionFunctionType;  // same signature
+  int applied_force_func_id  = -1;
+  int applied_torque_func_id = -1;
+  ForceFunctionType  applied_force_func;
+  TorqueFunctionType applied_torque_func;
+
+  // added: "Freeze on axis exit" -- a runtime safety mechanism for dynamic
+  // bodies. When enabled, the engine checks every step whether the body's
+  // position[freeze_axis] has left the interval [freeze_axis_min,
+  // freeze_axis_max]. Once it leaves, the body becomes "frozen". The frozen
+  // state mimics a kinematic body with constant scripted_position and
+  // scripted_rotation set to the pose captured at the moment of freezing:
+  //   - position and rotation are pinned to their captured values every step
+  //     (any drift from soil contact impulses is reverted),
+  //   - linear and angular velocities are zeroed every step,
+  //   - applied_force / applied_force_func / applied_torque /
+  //     applied_torque_func are no longer applied.
+  // Gravity and contact impulses from the soil continue to be computed; they
+  // simply have no net effect on the rigid body, but the soil keeps reacting
+  // to the wheel's presence. The MPM simulation as a whole continues.
+  // Once frozen, the body STAYS frozen for the rest of the simulation --
+  // there is no "unfreeze".
+  bool   freeze_on_axis_exit;   // master switch, default false
+  int    freeze_axis;           // 0 = x, 1 = y, 2 = z (3D); 0 / 1 in 2D
+  real   freeze_axis_min;
+  real   freeze_axis_max;
+  bool   is_frozen;             // runtime state, becomes true once triggered
+  // Captured pose at the moment the body first became frozen. Used to pin
+  // the body in place on every subsequent step, mirroring kinematic mode.
+  Vector       frozen_position;
+  Rotation<dim> frozen_rotation;
+
   TC_IO_DECL {
     TC_IO(codimensional, frictions, restitution, mesh_to_centroid, mass,
           inv_mass);
@@ -99,6 +147,18 @@ struct RigidBody {
     mut = std::make_unique<std::mutex>();
     rigid_force = Vector(0.0f);  // added
     rigid_torque = Vector(0.0f);  // added
+    applied_force = Vector(0.0f);   // added: external driving force (static)
+    applied_torque = Vector(0.0f);  // added: external driving torque (static)
+    // Function forms default to empty (std::function with no target).
+    // The engine checks .operator bool() before calling.
+    // Freeze-on-axis-exit defaults to OFF; users opt in via the config.
+    freeze_on_axis_exit = false;
+    freeze_axis         = 0;
+    freeze_axis_min     = -1e30_f;
+    freeze_axis_max     =  1e30_f;
+    is_frozen           = false;
+    frozen_position     = Vector(0.0_f);
+    // frozen_rotation default-constructs to identity via Rotation<dim>().
   }
 
   void set_as_background() {
